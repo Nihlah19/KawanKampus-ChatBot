@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KawanKampus - AI Assistant</title>
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+
+    <style>
+      /* Styling Scrollbar */
+      .chat-scroll::-webkit-scrollbar {
+        width: 8px;
+      }
+      .chat-scroll::-webkit-scrollbar-track {
+        background: #f8fafc;
+      }
+      .chat-scroll::-webkit-scrollbar-thumb {
+        background: #cbd5e1;
+        border-radius: 10px;
+      }
+      .chat-scroll::-webkit-scrollbar-thumb:hover {
+        background: #94a3b8;
+      }
+      .no-scrollbar::-webkit-scrollbar {
+        display: none;
+      }
+      .no-scrollbar {
+        -ms-overflow-style: none;
+        scrollbar-width: none;
+      }
+
+      /* Markdown Styling */
+      .markdown-body p {
+        margin-bottom: 0.75em;
+      }
+      .markdown-body p:last-child {
+        margin-bottom: 0;
+      }
+      .markdown-body ul {
+        list-style-type: disc;
+        padding-left: 1.5em;
+        margin-bottom: 0.75em;
+      }
+      .markdown-body strong {
+        font-weight: 700;
+        color: #1e293b;
+      }
+    </style>
+  </head>
+  <body class="bg-slate-100 font-sans h-screen flex flex-col p-0 md:p-6 lg:p-10">
+    <!-- Kontainer Utama Chat (Bukan Pop-up) -->
+    <div class="w-full max-w-5xl mx-auto h-full bg-white md:rounded-3xl shadow-xl border border-slate-200 flex flex-col overflow-hidden">
+      <!-- Header Chat -->
+      <div class="bg-gradient-to-r from-indigo-600 to-blue-500 p-5 md:p-6 flex justify-between items-center text-white shrink-0 z-10 shadow-md">
+        <div class="flex items-center space-x-4">
+          <div class="w-12 h-12 bg-white rounded-full flex items-center justify-center text-indigo-600 text-2xl shadow-inner">
+            <i class="fa-solid fa-robot"></i>
+          </div>
+          <div>
+            <h1 class="font-bold text-xl md:text-2xl leading-tight tracking-wide">KawanKampus</h1>
+            <p class="text-sm text-indigo-100 flex items-center mt-0.5"><span class="w-2.5 h-2.5 rounded-full bg-green-400 mr-2 animate-pulse"></span> Asisten AI Mahasiswa Siap Membantu</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Area Pesan -->
+      <div id="chat-messages" class="flex-1 p-4 md:p-8 overflow-y-auto chat-scroll flex flex-col space-y-6 bg-slate-50 relative">
+        <!-- Pesan Pembuka -->
+        <div class="flex justify-start">
+          <div class="bg-white text-slate-800 p-4 md:p-5 rounded-2xl rounded-tl-sm shadow-sm border border-slate-200 max-w-[90%] md:max-w-[75%] text-base md:text-lg">
+            Halo Sobat! 👋 Aku <strong>KawanKampus</strong>. Mau bahas apa hari ini?<br /><br />
+            Aku bisa bantu ngerjain tugas, nyariin referensi tempat nongkrong/nugas, atau sekadar dengerin cerita random kamu!
+          </div>
+        </div>
+      </div>
+
+      <!-- Area Input & Pilihan Cepat -->
+      <div class="p-4 md:p-6 bg-white border-t border-slate-200 shrink-0">
+        <!-- Pilihan Cepat (3 Tombol) -->
+        <div class="flex space-x-3 overflow-x-auto no-scrollbar mb-4 pb-2">
+          <button
+            onclick="quickReply('Bantu kerjakan tugas kuliahku')"
+            class="cursor-pointer whitespace-nowrap bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-full px-5 py-2.5 text-sm md:text-base font-medium transition-colors flex items-center"
+          >
+            <i class="fa-solid fa-book-open mr-2 text-indigo-500"></i> Bantu Tugas
+          </button>
+
+          <button
+            onclick="mintaRekomendasiTempat()"
+            class="cursor-pointer whitespace-nowrap bg-teal-50 hover:bg-teal-100 text-teal-700 border border-teal-200 rounded-full px-5 py-2.5 text-sm md:text-base font-medium transition-colors flex items-center"
+          >
+            <i class="fa-solid fa-map-location-dot mr-2 text-teal-500"></i> Rekomendasi Tempat
+          </button>
+
+          <button
+            onclick="quickReply('Ceritain hal random yang lucu dong!')"
+            class="cursor-pointer whitespace-nowrap bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 rounded-full px-5 py-2.5 text-sm md:text-base font-medium transition-colors flex items-center"
+          >
+            <i class="fa-solid fa-face-smile-beam mr-2 text-amber-500"></i> Cerita Random
+          </button>
+        </div>
+
+        <!-- Form Input -->
+        <form id="chat-form" class="flex items-center bg-slate-100 rounded-full p-1.5 md:p-2 border border-slate-300 focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-200 transition-all shadow-inner">
+          <input type="text" id="chat-input" class="flex-1 bg-transparent border-none outline-none px-5 py-3 md:py-4 text-base md:text-lg text-slate-800 placeholder-slate-400" placeholder="Ketik pesanmu di sini..." autocomplete="off" />
+          <button type="submit" id="send-btn" class="cursor-pointer w-12 h-12 md:w-14 md:h-14 bg-indigo-600 text-white rounded-full flex items-center justify-center hover:bg-indigo-700 disabled:opacity-50 transition-colors shadow-md ml-2">
+            <i class="fa-solid fa-paper-plane text-lg md:text-xl transform -translate-x-0.5 translate-y-0.5"></i>
+          </button>
+        </form>
+        <div class="text-center mt-3 text-xs text-slate-400">KawanKampus dapat membuat kesalahan. Harap periksa kembali info penting.</div>
+      </div>
+    </div>
+
+    <!-- Script Logika -->
+    <script>
+      let isWaiting = false;
+      let conversationHistory = [];
+
+      const chatMessages = document.getElementById("chat-messages");
+      const chatInput = document.getElementById("chat-input");
+      const sendBtn = document.getElementById("send-btn");
+
+      // Fungsi menambah pesan ke UI
+      function appendMessage(text, sender, isHTML = false) {
+        const msgDiv = document.createElement("div");
+        msgDiv.className = `flex ${sender === "user" ? "justify-end" : "justify-start"} w-full`;
+
+        let content = text;
+        if (sender === "bot" && !isHTML) {
+          content = marked.parse(text); // Parse markdown jika text biasa dari bot
+        }
+
+        const bgColor = sender === "user" ? "bg-indigo-600 text-white rounded-tr-sm" : "bg-white text-slate-800 border border-slate-200 rounded-tl-sm";
+
+        msgDiv.innerHTML = `
+          <div class="${bgColor} p-4 md:p-5 rounded-2xl shadow-sm max-w-[90%] md:max-w-[75%] text-base md:text-lg break-words ${sender === "bot" && !isHTML ? "markdown-body" : ""}">
+            ${content}
+          </div>
+        `;
+        chatMessages.appendChild(msgDiv);
+        scrollToBottom();
+      }
+
+      function scrollToBottom() {
+        setTimeout(() => {
+          chatMessages.scrollTop = chatMessages.scrollHeight;
+        }, 100);
+      }
+
+      function showTyping() {
+        const div = document.createElement("div");
+        div.id = "typing";
+        div.className = "flex justify-start w-full";
+        div.innerHTML = `
+          <div class="bg-white border border-slate-200 p-4 md:p-5 rounded-2xl rounded-tl-sm shadow-sm flex space-x-2 max-w-[90%] md:max-w-[75%]">
+            <div class="w-2.5 h-2.5 bg-slate-400 rounded-full animate-bounce"></div>
+            <div class="w-2.5 h-2.5 bg-slate-400 rounded-full animate-bounce" style="animation-delay:0.2s"></div>
+            <div class="w-2.5 h-2.5 bg-slate-400 rounded-full animate-bounce" style="animation-delay:0.4s"></div>
+          </div>
+        `;
+        chatMessages.appendChild(div);
+        scrollToBottom();
+      }
+
+      // Fungsi Eksekusi Chat ke Backend
+      async function executeChat(promptToBackend, displayMsg) {
+        isWaiting = true;
+        sendBtn.disabled = true;
+        showTyping();
+
+        try {
+          // Endpoint Python (Sesuaikan saat deploy)
+          const response = await fetch("http://localhost:5000/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: promptToBackend, history: conversationHistory }),
+          });
+
+          const data = await response.json();
+          document.getElementById("typing")?.remove();
+
+          if (data.reply) {
+            appendMessage(data.reply, "bot");
+            // Simpan riwayat
+            conversationHistory.push({ role: "user", parts: [{ text: promptToBackend }] });
+            conversationHistory.push({ role: "model", parts: [{ text: data.reply }] });
+          } else {
+            appendMessage("Maaf, server lagi sibuk. Coba lagi ya!", "bot");
+          }
+        } catch (err) {
+          document.getElementById("typing")?.remove();
+          appendMessage("Gagal terhubung ke server backend.", "bot");
+        } finally {
+          isWaiting = false;
+          sendBtn.disabled = false;
+          chatInput.focus();
+        }
+      }
+
+      // Fungsi standar kirim pesan (dari text box atau quick reply biasa)
+      function processChat(msg) {
+        if (!msg.trim() || isWaiting) return;
+        appendMessage(msg, "user");
+        chatInput.value = "";
+        executeChat(msg, msg);
+      }
+
+      // Quick reply sederhana
+      function quickReply(text) {
+        processChat(text);
+      }
+
+      // Fungsi Khusus Geolocation untuk Rekomendasi Tempat
+      function mintaRekomendasiTempat() {
+        if (isWaiting) return;
+
+        if (!navigator.geolocation) {
+          appendMessage("Browser kamu tidak mendukung fitur lokasi. Mencari rekomendasi secara umum...", "bot");
+          processChat("Berikan rekomendasi tempat nyaman untuk mahasiswa.");
+          return;
+        }
+
+        // Munculkan status di UI
+        const tempMsgId = "loc-search-" + Date.now();
+        const msgDiv = document.createElement("div");
+        msgDiv.id = tempMsgId;
+        msgDiv.className = `flex justify-start w-full`;
+        msgDiv.innerHTML = `
+          <div class="bg-white text-slate-800 border border-slate-200 p-4 rounded-2xl rounded-tl-sm shadow-sm flex items-center space-x-3 text-base">
+            <i class="fa-solid fa-compass fa-spin text-indigo-500 text-xl"></i>
+            <span>Mendeteksi lokasimu saat ini...</span>
+          </div>
+        `;
+        chatMessages.appendChild(msgDiv);
+        scrollToBottom();
+
+        navigator.geolocation.getCurrentPosition(
+          (position) => {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            // Hapus pesan "Mendeteksi..."
+            document.getElementById(tempMsgId)?.remove();
+
+            // Tampilkan GMaps Iframe dan Info ke User
+            const mapHtml = `
+              <div class="mb-3 font-semibold text-slate-800"><i class="fa-solid fa-location-dot text-red-500 mr-2"></i>Lokasimu ditemukan!</div>
+              <iframe width="100%" height="250" frameborder="0" scrolling="no" marginheight="0" marginwidth="0" 
+                src="https://maps.google.com/maps?q=${lat},${lon}&z=15&output=embed" 
+                class="rounded-xl shadow-md border border-slate-200 mb-3">
+              </iframe>
+              <div class="text-sm text-slate-600 bg-slate-100 p-3 rounded-lg border border-slate-200">
+                Mencarikan rekomendasi tempat terbaik di sekitarmu...
+              </div>
+            `;
+            appendMessage(mapHtml, "bot", true);
+
+            // Pesan dari user yang akan ditampilkan di layar
+            const displayUserMsg = "Rekomendasi tempat terdekat dari lokasiku.";
+            // Pesan sesungguhnya yang dikirim ke backend (agar AI paham titik lokasinya)
+            const promptToBackend = `Tolong berikan 3 rekomendasi tempat (seperti kafe, perpustakaan, atau taman) yang nyaman untuk nugas atau nongkrong mahasiswa, yang lokasinya dekat dengan Latitude: ${lat} dan Longitude: ${lon}. Jelaskan kelebihannya.`;
+
+            appendMessage(displayUserMsg, "user");
+            executeChat(promptToBackend, displayUserMsg);
+          },
+          (error) => {
+            document.getElementById(tempMsgId)?.remove();
+            appendMessage("❌ Yah, gagal mendapatkan izin lokasi. Pastikan GPS kamu aktif ya. Aku akan mencarikan rekomendasi secara umum saja.", "bot");
+            processChat("Berikan rekomendasi tempat nyaman untuk nugas/mahasiswa.");
+          },
+          { enableHighAccuracy: true, timeout: 10000 }, // Tambahan akurasi
+        );
+      }
+
+      // Listener Form Submit
+      document.getElementById("chat-form").addEventListener("submit", (e) => {
+        e.preventDefault();
+        processChat(chatInput.value);
+      });
+
+      // Fokus input di awal
+      window.onload = () => chatInput.focus();
+    </script>
+  </body>
+</html>
