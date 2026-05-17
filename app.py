@@ -1,4 +1,4 @@
-# app.py
+# app.py (DEPLOY INI DI RENDER SENDERIAN)
 
 import os
 import re
@@ -36,15 +36,17 @@ load_dotenv()
 
 # vertexai sdk akan membaca GOOGLE_APPLICATION_CREDENTIALS secara otomatis
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-LOCATION = "us-central1"
+LOCATION = os.getenv("GCP_LOCATION", "us-central1") # Ambil dari env, default us-central1
 
 app = Flask(__name__)
-CORS(app)
+CORS(app) # CORS diaktifkan biar Frontend Fullstack bisa nembak langsung
 
-MEMORY_FOLDER = "memory"
+# --- LOGIC HISTORI CHAT (JSON File-Based NoSQL) ---
+# Folder buat nyimpen file JSON histori per user
+HISTORY_FOLDER = "chat_histories"
+os.makedirs(HISTORY_FOLDER, exist_ok=True)
+
 DATASET_FILE = "cleaned_places.csv"  # File data kamu
-
-os.makedirs(MEMORY_FOLDER, exist_ok=True)
 
 # =====================================================
 # SINKRONISASI NAMA KOLOM DATASET
@@ -56,7 +58,7 @@ COL_LAT = "Latitude"
 COL_LON = "Longitude"
 
 # =====================================================
-# LOAD & CLEAN DATASET (Logika Rekomendasi Dipertahankan)
+# LOAD & CLEAN DATASET (Logika Rekomendasi Dipertahankan Total)
 # =====================================================
 places_df = None
 cleaned_kampus_list = []
@@ -147,7 +149,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 # =====================================================
-# LOGIKA PENCARIAN BERDASARKAN JARAK TERDEKAT (Maks 5)
+# LOGIKA PENCARIAN BERDASARKAN JARAK TERDEKAT (Dipertahankan)
 # =====================================================
 def get_nearest_recommendations(user_lat, user_lon, uni_name, category_name):
     global places_df
@@ -183,7 +185,7 @@ def get_nearest_recommendations(user_lat, user_lon, uni_name, category_name):
             "name": row[COL_NAMA], # Nama asli dari CSV
             "distance": f"📍 Jarak: {dist_str}",
             "hours": f"{row[COL_KATEGORI].title()} - Sekitar {row[COL_KAMPUS].title()}", 
-            "map_link": f"https://https://www.google.com/maps/search/?api=1&query=?q={row[COL_LAT]},{row[COL_LON]}"
+            "map_link": f"https://www.google.com/maps/search/?api=1&query={row[COL_LAT]},{row[COL_LON]}"
         })
 
     reply = f"Oke, berdasarkan lokasi kamu saat ini, ini 5 rekomendasi {category_name.upper()} paling dekat dari kampus {uni_name.upper()} yang aku temuin murni menggunakan database Full-Stack:"
@@ -226,27 +228,92 @@ init_model()
 # SYSTEM PROMPT (Updated to show thought process)
 # =====================================================
 SYSTEM_PROMPT = """
-Kamu adalah KawanKampus AI, asisten virtual mahasiswa Indonesia.
-Tugas utama kamu adalah membantu mengerjakan tugas kuliah atau menjelaskan materi.
+Latar Belakang Persona:
+Kamu adalah KawanKampus AI, tutor sebaya (peer tutor) dan mentor akademis virtual terkemuka untuk mahasiswa di Indonesia. Persona kamu adalah mahasiswa tingkat akhir yang jenius, berpengetahuan luas, metodis, namun sangat suportif, rendah hati, dan mudah didekati. Kamu bukan sekadar memberikan jawaban, tetapi mengajarkan cara berpikir.
 
-Gaya bicara:
-- Santai, Natural, Friendly
-- Seperti teman kampus pintar
+Misi Utama:
+Membantu user (mahasiswa) menyelesaikan tugas kuliah mereka dengan memberikan penjelasan yang mendalam, akurat secara akademis, dan komprehensif. Tujuan akhirmu adalah memastikan user memahami materi, bukan hanya menyalin jawaban.
 
-Aturan respon:
-- Tunjukkan langkah berpikirmu secara jelas dan logis sebelum memberikan jawaban akhir.
-- Jawaban singkat, jelas, langsung ke inti.
-- Jangan bertele-tele.
-- Fokus membantu user menyelesaikan masalah tugasnya.
-- Jangan mengulang pertanyaan user.
-- Jangan pernah bilang "Sebagai AI..." atau sejenisnya.
+Gaya Bicara & Nada:
+- Gunakan bahasa Indonesia yang santai, natural, friendly, dan menggunakan jargon kampus umum sewajarnya (seperti "aku/kamu", "nih", "deh", "opspek", "skripsian").
+- Hindari bahasa yang terlalu kaku/formal seperti surat dinas, tetapi tetap menjaga kesopanan akademis.
+- Terdengar seperti teman kos yang pintar yang sedang mengajari temannya sebelum ujian.
+
+Protokol Respon Wajib (Ikuti urutan ini dengan ketat):
+
+Langkah 1: Analisis Masalah & Metodologi [Berpikir]
+Sebelum memberikan jawaban apa pun, tuliskan analisis mendalam kamu terhadap pertanyaan user di dalam blok terpisah dengan judul "**[Analisis KawanKampus]**". Di sini kamu harus:
+a. Identifikasi inti masalah dan tujuan pertanyaan.
+b. Tentukan teori, rumus, konsep akademis, atau kerangka berpikir yang relevan yang akan digunakan untuk menjawab.
+c. Uraikan langkah-langkah logis yang akan kamu tempuh untuk menyusun jawaban akhir.
+
+Langkah 2: Penjelasan Teoretis & Kontekstual
+Jelaskan konsep dasar atau teori pendukung yang relevan dengan pertanyaan tersebut secara detail. Gunakan analogi dunia nyata atau contoh kasus di Indonesia agar lebih mudah dipahami.
+
+Langkah 3: Langkah-langkah Penyelesaian (Lakukan Perhitungan/Analisis)
+Tunjukkan proses penyelesaian masalah secara bertahap (step-by-step).
+- Jika bersifat hitungan, tunjukkan rumusnya, substitusi angkanya, dan proses perhitungannya dengan rapi menggunakan LaTeX untuk persamaan matematika.
+- Jika bersifat analisis/esai, bangun argumen yang kuat, gunakan data (jika ada), dan referensikan konsep akademis yang relevan.
+
+Langkah 4: Jawaban Akhir & Kesimpulan
+Berikan jawaban akhir yang spesifik dan jelas dari pertanyaan user. Rangkum poin-poin penting dari penyelesaian yang telah dilakukan.
+
+Langkah 5: Tips Tambahan/Pengayaan
+Berikan satu tips tambahan, saran bacaan lanjutan, atau perangkap umum yang harus dihindari terkait materi tersebut untuk membantu user belajar lebih lanjut.
+
+Aturan Tambahan & Larangan:
+- HILANGKAN ATURAN "JAWABAN SINGKAT". Jawaban harus detail, mendalam, dan komprehensif. Jangan memotong penjelasan penting demi kesingkatan.
+- Gunakan Markdown secara kaya: gunakan **bold** untuk penekanan, *italic* untuk istilah asing, `inline code` untuk variabel, dan blok kode untuk pemrograman.
+- JANGAN BERTELE-TELE dengan ramah tamah yang tidak perlu (misalnya, "Halo, apa kabar? Semoga hari kamu menyenangkan, aku akan menjawab pertanyaamu..."). Langsung masuk ke protokol respon.
+- Jangan mengulang pertanyaan user secara verbatim. Langsung interpretasikan masalahnya di bagian Analisis.
+- JANGAN PERNAH menggunakan frasa "Sebagai AI", "Saya adalah model bahasa", atau sejenisnya. Tetaplah dalam persona teman kampus pintar.
+- Jika user memberikan file atau codingan, berikan perbaikan yang clean, gunakan code block, dan jelaskan setiap perubahan logikanya.
 """
+
+# =====================================================
+# UTILITIES LOGIKAHISTORI (New)
+# =====================================================
+def get_time():
+    return datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+
+def load_user_history(user_id: str):
+    """Membaca file JSON histori chat berdasarkan ID User."""
+    # Amankan filename, hapus karakter aneh
+    safe_filename = "".join([c for c in user_id if c.isalpha() or c.isdigit() or c=='@' or c=='.']).rstrip()
+    filepath = os.path.join(HISTORY_FOLDER, f"{safe_filename}.json")
+    
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return [] # Kalo ga ada, balikin list kosong
+
+def save_user_chat(user_id: str, role: str, message: str):
+    """Menambahkan chat baru ke file JSON histori User."""
+    safe_filename = "".join([c for c in user_id if c.isalpha() or c.isdigit() or c=='@' or c=='.']).rstrip()
+    filepath = os.path.join(HISTORY_FOLDER, f"{safe_filename}.json")
+    
+    # Load data lama
+    history = load_user_history(user_id)
+    
+    # Tambah data baru
+    history.append({
+        "role": role,
+        "message": message,
+        "timestamp": get_time()
+    })
+    
+    # Simpan kembali
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
 
 # =====================================================
 # ROUTES & CHAT MAIN LOGIC 
 # =====================================================
-@app.route("/")
-def home(): return render_template("index.html")
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "KawanKampus AI Server is Running", "version": "Stateful-NoSQL-v1"}), 200
 
 @app.route("/data/config")
 def get_config():
@@ -257,15 +324,27 @@ def get_config():
         "kategori": cleaned_category_list
     })
 
+# --- PERBAIKAN TOTAL ENDPOINT CHAT (Updated for History) ---
 @app.route("/chat", methods=["POST"])
 def chat():
     global model
     try:
+        # Flask ngebaca request.form (multpart/form-data)
         data = request.form
+        
+        # --- TAMBAHAN KRUSIAL: Ambil ID User dari Fullstack ---
+        user_id = data.get("user_id")
+        if not user_id:
+             return jsonify({"success": False, "error": "Mana user_id nya, Bro? Wajib dikirim dari Fullstack."}), 400
+
         special_action = data.get("special_action")
+        user_message = data.get("message", "").strip()
+
+        # 1. Simpan Pesan User ke Histori NoSQL di Render
+        save_user_chat(user_id, "user", user_message)
 
         # =====================================================
-        # MODE A: REKOMENDASI LOKASI (Pure Logic)
+        # MODE A: REKOMENDASI LOKASI (Pure Logic - Dipertahankan)
         # =====================================================
         if special_action == "recommendation_proximity":
             user_lat = data.get("lat")
@@ -285,6 +364,9 @@ def chat():
             # Gunakan logika pure Full-Stack murni
             rec_data, reply_text = get_nearest_recommendations(lat, lon, selected_uni, selected_cat)
             
+            # Simpan balasan Bot murni logic ke Histori
+            save_user_chat(user_id, "assistant", reply_text)
+
             return jsonify({
                 "success": True,
                 "reply": reply_text,
@@ -295,15 +377,13 @@ def chat():
         # MODE B: BANTU TUGAS atau Chat Biasa (Route ke AI - Restored)
         # =====================================================
         else:
-            user_message = data.get("message", "").strip()
-            
-            # --- TAMBAHAN KRUSIAL: Cek flag task_mode dari Frontend ---
+            # Cek flag task_mode dari Frontend untuk menghentikan loopingFallback
             is_task_mode_active = data.get("task_mode") == "true"
 
             if not user_message:
                 return jsonify({"success": False, "error": "Pesan kosong."}), 400
                 
-            # --- LOGIKA BARU: Prioritaskan Flag Mode Tugas ---
+            # Logika Percabangan dalam Mode Chat Biasa
             if is_task_mode_active or "tugas" in user_message.lower():
                 # -------------------------------------------------
                 # SUB-MODE: BANTU TUGAS (Minta Respon Vertex AI)
@@ -312,26 +392,25 @@ def chat():
                     init_model()
                 
                 if model is None:
-                    return jsonify({"success": False, "error": "AI offline. Bantu tugas tidak tersedia."}), 500
+                    ai_reply = "AI offline, Bro. Bantu tugas ga bisa jalan."
+                else:
+                    # Prompt murni fokus pertanyaan saat ini (Tanpa context lama sesuai request)
+                    prompt = f"""{SYSTEM_PROMPT}\n\nPertanyaan/Tugas User (Murni AI Tanpa CSV):\n{user_message}\n\nAssistant:"""
 
-                # Bangun Prompt Tanpa Riwayat Chat (murni fokus pertanyaan saat ini)
-                prompt = f"""{SYSTEM_PROMPT}\n\nPertanyaan/Tugas User (Murni AI Tanpa CSV):\n{user_message}\n\nAssistant:"""
-
-                # GENERATE AI
-                try:
-                    response = model.generate_content(prompt)
-                    ai_reply = getattr(response, "text", "")
-                except ResourceExhausted:
-                    return jsonify({
-                        "success": False,
-                        "error": "LIMIT_VERTEX",
-                        "message": "Quota AI sedang padat. Coba lagi nanti."
-                    }), 429
-                except Exception as e:
-                     ai_reply = f"Terjadi kesalahan AI: {str(e)}"
+                    # GENERATE AI
+                    try:
+                        response = model.generate_content(prompt)
+                        ai_reply = getattr(response, "text", "")
+                    except ResourceExhausted:
+                        ai_reply = "Quota AI padat, coba lagi nanti semenit lagi."
+                    except Exception as e:
+                         ai_reply = f"Terjadi kesalahan AI: {str(e)}"
 
                 if not ai_reply: 
                     ai_reply = "Maaf, AI ga konek. Bisa ulangi pertanyaannya?"
+
+                # Simpan balasan AI ke Histori NoSQL di Render
+                save_user_chat(user_id, "assistant", ai_reply)
 
                 return jsonify({
                     "success": True, 
@@ -343,18 +422,32 @@ def chat():
                 # -------------------------------------------------
                 # SUB-MODE: FALLBACK (Pure Backend Response)
                 # -------------------------------------------------
-                # Ini akan muncul jika user mengetik sembarang teks di input chat
-                # JIKA BUKAN dalam mode tugas (Flag 'isTaskMode' di JS mati)
+                # JIKA BUKAN dalam mode tugas
+                reply_text = "Maaf, saat ini aku murni bekerja berdasarkan tombol workflow untuk rekomendasi tempat, atau menjawab tentang 'Bantu Tugas'. Gunakan tombol di halaman awal ya!"
+                save_user_chat(user_id, "assistant", reply_text)
+
                 return jsonify({
                     "success": True, 
-                    "reply": "Maaf, saat ini aku murni bekerja berdasarkan tombol workflow untuk rekomendasi tempat, atau menjawab tentang 'Bantu Tugas'. Gunakan tombol di halaman awal ya!"
+                    "reply": reply_text
                 })
 
     except Exception as e:
         print("ERROR HYBRID CHAT:", e)
         return jsonify({"success": False, "error": str(e)}), 500
 
+# --- NEW ENDPOINT: AMBIL HISTORI (Buat nampilin di profil user) ---
+@app.route("/api/history/<user_id>", methods=["GET"])
+def get_history_endpoint(user_id):
+    """Endpoint buat Frontend Fullstack ngambil histori chat si user."""
+    # Backend Node.js/PHP lu tinggal nembak GET ke sini pas user buka halaman chat
+    history = load_user_history(user_id)
+    return jsonify({
+        "user_id": user_id,
+        "history": history
+    })
+
 if __name__ == "__main__":
+    # Load history dinonaktifkan di frontend awal, jadi route history dihapus
     app.run(
         host="0.0.0.0",
         port=5000,

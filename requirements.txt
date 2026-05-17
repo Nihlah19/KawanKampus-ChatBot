@@ -1,0 +1,8 @@
+# requirements.txt
+Flask
+flask-cors
+pandas
+vertexai
+google-cloud-aiplatform
+python-dotenv
+gunicorn
