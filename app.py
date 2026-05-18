@@ -1,3 +1,5 @@
+# app.py (VERSI FREEMIUM, RATE LIMITING & CONFIG INTEGRATED)
+
 import os
 import re
 import json
