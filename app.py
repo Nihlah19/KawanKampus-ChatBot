@@ -1,5 +1,3 @@
-# app.py (VERSI FREEMIUM & RATE LIMITING)
-
 import os
 import re
 import json
@@ -38,7 +36,7 @@ if not os.path.exists(QUOTA_FILE):
 
 DATASET_FILE = "cleaned_places.csv"
 
-# --- LOGIKA REKOMENDASI LOKASI (DIPERTENGAHKAN, GW SKIP BIAR PENDEK, TETEP PAKE YANG LAMA YA) ---
+# --- LOGIKA REKOMENDASI LOKASI (DIPERTENGAHKAN, TETEP PAKE YANG LAMA YA) ---
 # ... (Masukkan fungsi load_and_clean_dataset() dan get_nearest_recommendations() lu di sini) ...
 
 # =====================================================
@@ -106,7 +104,7 @@ Aturan Tambahan & Larangan:
 """
 
 # =====================================================
-# UTILITIES: HISTORI & LIMITASI KUOTA (NEW LOGIC)
+# UTILITIES: HISTORI & LIMITASI KUOTA
 # =====================================================
 def get_time():
     return datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
@@ -171,6 +169,17 @@ def get_simple_reply(text: str):
 def home():
     return jsonify({"status": "KawanKampus AI API Running", "version": "Freemium-v2"}), 200
 
+# 🌟 NEW ENDPOINT: BUAT JAWAB PERMINTAAN /data/config DARI HTML 🌟
+@app.route("/data/config", methods=["GET"])
+def get_config():
+    # Catatan: Silakan sesuaikan nama kampus dan kategori di bawah ini 
+    # dengan isi kolom yang beneran ada di file "cleaned_places.csv" lu!
+    config_data = {
+        "kampus": ["UI", "ITB", "UGM", "UNPAD", "UB", "ITS", "UNDIP", "UNS"], 
+        "kategori": ["Kosan", "Warkop", "Cafe", "Fotokopi", "Warung Makan", "Restoran"]
+    }
+    return jsonify(config_data), 200
+
 @app.route("/chat", methods=["POST"])
 def chat():
     global model
@@ -187,7 +196,7 @@ def chat():
         save_user_chat(user_id, "user", user_message)
 
         # =====================================================
-        # MODE A: REKOMENDASI LOKASI (Diskip logikanya di sini biar lu fokus, tetep pake yang lama)
+        # MODE A: REKOMENDASI LOKASI (Gunakan logic pencarian jarak lu di sini)
         # =====================================================
         if special_action == "recommendation_proximity":
             reply_text = "Logic rekomendasi kampus lu jalan di sini."
