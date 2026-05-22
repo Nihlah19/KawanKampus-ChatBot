@@ -1,5 +1,3 @@
-# app.py (VERSI FREEMIUM, RATE LIMITING & CONFIG INTEGRATED)
-
 import os
 import re
 import json
@@ -13,7 +11,8 @@ from vertexai.generative_models import GenerativeModel
 from google.api_core.exceptions import ResourceExhausted
 from dotenv import load_dotenv
 from datetime import datetime
-from zoneinfo import ZoneInfo
+import zoneinfo
+from flask_sqlalchemy import SQLAlchemy
 
 load_dotenv()
 
@@ -24,22 +23,198 @@ app = Flask(__name__)
 CORS(app)
 
 # =====================================================
-# SYSTEM STORAGE (Histori & Kuota)
+# SYSTEM STORAGE & DATABASE CONFIGURATION 
 # =====================================================
-HISTORY_FOLDER = "chat_histories"
-os.makedirs(HISTORY_FOLDER, exist_ok=True)
+# Membaca DATABASE_URL dari environment variable (untuk Postgres di Cloud Run)
+# Jika tidak ada, otomatis menggunakan SQLite lokal (kawankampus.db)
+DATABASE_URL = os.environ.get(
+    "DATABASE",
+    "sqlite:///kawankampus.db"
+)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# File JSON buat nyatet kuota Vertex AI per user
-QUOTA_FILE = "user_quotas.json"
-
-if not os.path.exists(QUOTA_FILE):
-    with open(QUOTA_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f)
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+db = SQLAlchemy(app)
 
 DATASET_FILE = "cleaned_places.csv"
 
-# --- LOGIKA REKOMENDASI LOKASI (DIPERTENGAHKAN, TETEP PAKE YANG LAMA YA) ---
-# ... (Masukkan fungsi load_and_clean_dataset() dan get_nearest_recommendations() lu di sini) ...
+# =====================================================
+# DATABASE MODELS (PENGGANTI JSON LOKAL)
+# =====================================================
+class User(db.Model): #buat nampung user_id dan kuota, biar ga perlu file JSON lagi
+    __tablename__ = 'users'
+    id = db.Column(db.String(100), primary_key=True) # user_id dari frontend
+    quota_used = db.Column(db.Integer, default=0)    # Pengganti user_quotas.json
+    created_at = db.Column(db.DateTime, default=datetime.utcnow) # Timestamp pembuatan user
+    sessions = db.relationship('ChatSession', backref='user', lazy=True) # Relasi ke sesi chat (1 user bisa punya banyak sesi)
+
+class ChatSession(db.Model): #buat nampung tiap ruang chat, biar bisa multi-session
+    __tablename__ = 'chat_sessions'
+    id = db.Column(db.String(100), primary_key=True) # session_id ruang chat
+    user_id = db.Column(db.String(100), db.ForeignKey('users.id'), nullable=False)
+    title = db.Column(db.String(200), default="Obrolan Baru")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    messages = db.relationship('Message', backref='session', lazy=True, cascade="all, delete-orphan")
+
+class Message(db.Model): #buat nampung histori pesan per sesi, biar ga perlu file JSON lagi
+    __tablename__ = 'messages'
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(100), db.ForeignKey('chat_sessions.id'), nullable=False)
+    role = db.Column(db.String(20), nullable=False) # 'user' atau 'assistant'
+    content = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.String(50), nullable=False)
+
+# Buat tabel otomatis jika belum terbuat
+with app.app_context():
+    db.create_all()
+
+# =====================================================
+# LOGIKA REKOMENDASI LOKASI 
+# =====================================================
+# =====================================================
+# SINKRONISASI NAMA KOLOM DATASET
+# =====================================================
+COL_KAMPUS = "Kampus"
+COL_NAMA = "Nama_Tempat"
+COL_KATEGORI = "Kategori_Awal" 
+COL_LAT = "Latitude"
+COL_LON = "Longitude"
+
+# =====================================================
+# LOAD & CLEAN DATASET (Logika Rekomendasi Dipertahankan Total)
+# =====================================================
+places_df = None
+cleaned_kampus_list = []
+cleaned_category_list = []
+
+def load_and_clean_dataset():
+    global places_df, cleaned_kampus_list, cleaned_category_list
+    try:
+        if os.path.exists(DATASET_FILE):
+            # 1. Load CSV
+            df = pd.read_csv(DATASET_FILE, encoding='utf-8')
+            
+            # 2. Validasi Kolom Wajib Ada
+            required_cols = [COL_KAMPUS, COL_NAMA, COL_KATEGORI, COL_LAT, COL_LON]
+            if not all(col in df.columns for col in required_cols):
+                print(f"❌ ERROR: Kolom dataset tidak sinkron. Pastikan ada: {required_cols}")
+                places_df = pd.DataFrame()
+                return
+
+            # 3. Pastikan Koordinat & Kolom Vital tidak kosong & tipe data benar
+            df = df.dropna(subset=[COL_LAT, COL_LON, COL_KATEGORI, COL_KAMPUS])
+            df[COL_LAT] = pd.to_numeric(df[COL_LAT])
+            df[COL_LON] = pd.to_numeric(df[COL_LON])
+
+            # 4. Fungsi Pembersihan Teks
+            def clean_text(text):
+                if not isinstance(text, str): return ""
+                text = text.strip() 
+                # Hapus ekstensi .csv atau .Csv (case insensitive)
+                text = re.sub(r'(?i)\.csv$', '', text)
+                text = text.strip()
+                return text
+
+            # 5. Terapkan pembersihan dasar
+            df['kampus_clean'] = df[COL_KAMPUS].apply(clean_text)
+            df['jenis_clean'] = df[COL_KATEGORI].apply(clean_text)
+
+            # 6. Map Perbaikan Typo Spesifik 
+            category_typo_map = {
+                'fotocopy': 'fotokopi',
+                'reestoran padang': 'restoran padang',
+                'restaurant': 'restoran',
+                'toko eskrim': 'toko es krim',
+            }
+
+            def fix_typos(text):
+                lower_text = text.lower()
+                if lower_text in category_typo_map:
+                    return category_typo_map[lower_text]
+                return lower_text
+
+            # 7. Terapkan perbaikan typo dan buat ID Lowercase untuk pencarian
+            df['jenis_id'] = df['jenis_clean'].apply(fix_typos)
+            df['kampus_id'] = df['kampus_clean'].str.lower()
+
+            # 8. Simpan DataFrame yang sudah diproses
+            places_df = df
+            
+            # 9. Buat Daftar untuk Tombol UI (Unik, Terurut, Title Case)
+            raw_unis = df['kampus_clean'].unique()
+            cleaned_kampus_list = sorted([u.title() for u in raw_unis if u])
+
+            raw_categories_ids = df['jenis_id'].unique()
+            cleaned_category_list = sorted([c.title() for c in raw_categories_ids if c])
+
+            print(f"✅ DATASET SINKRON & DIBERSIHKAN (Pure Logic Rekomendasi Aktif).")
+            
+        else:
+            print(f"⚠️ DATASET TIDAK DITEMUKAN: File '{DATASET_FILE}' diperlukan.")
+            places_df = pd.DataFrame()
+
+    except Exception as e:
+        print(f"❌ GAGAL MEMUAT/MEMBERSIHKAN DATASET: {e}")
+        places_df = pd.DataFrame()
+
+load_and_clean_dataset()
+
+# =====================================================
+# GEOLOCATION LOGIC (Rumus Haversine)
+# =====================================================
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371.0 # Radius bumi km
+    l1, o1, l2, o2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = l2 - l1
+    dlon = o2 - o1
+    a = math.sin(dlat / 2)**2 + math.cos(l1) * math.cos(l2) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+# =====================================================
+# LOGIKA PENCARIAN BERDASARKAN JARAK TERDEKAT (Dipertahankan)
+# =====================================================
+def get_nearest_recommendations(user_lat, user_lon, uni_name, category_name):
+    global places_df
+    if places_df is None or places_df.empty:
+        return None, "Database tempat bermasalah atau kosong."
+
+    uni_id = uni_name.lower().strip()
+    cat_id = category_name.lower().strip()
+
+    # Filter berdasarkan Kampus ID DAN Kategori ID
+    results = places_df[
+        (places_df['kampus_id'] == uni_id) & 
+        (places_df['jenis_id'] == cat_id)
+    ].copy()
+
+    if results.empty:
+        return None, f"Yah, aku belum punya data {category_name.upper()} di sekitar kampus {uni_name.upper()} di database."
+
+    # Hitung jarak murni backend
+    results['distance_km'] = results.apply(
+        lambda row: haversine_distance(user_lat, user_lon, row[COL_LAT], row[COL_LON]),
+        axis=1
+    )
+
+    # Urutkan terdekat dan ambil 5
+    final_results = results.sort_values(by='distance_km').head(5)
+
+    recommendations_data = []
+    for _, row in final_results.iterrows():
+        dist_str = f"{int(row['distance_km'] * 1000)} m" if row['distance_km'] < 1 else f"{row['distance_km']:.1f} km"
+
+        recommendations_data.append({
+            "name": row[COL_NAMA], # Nama asli dari CSV
+            "distance": f"📍 Jarak: {dist_str}",
+            "hours": f"{row[COL_KATEGORI].title()} - Sekitar {row[COL_KAMPUS].title()}", 
+            "map_link": f"https://www.google.com/maps/search/?api=1&query={row[COL_LAT]},{row[COL_LON]}"
+        })
+
+    reply = f"Oke, berdasarkan lokasi kamu saat ini, ini 5 rekomendasi {category_name.upper()} paling dekat dari kampus {uni_name.upper()} yang aku temuin murni menggunakan database Full-Stack:"
+    return recommendations_data, reply
 
 # =====================================================
 # INIT VERTEX AI 
@@ -64,7 +239,7 @@ init_model()
 
 SYSTEM_PROMPT = """
 Latar Belakang Persona:
-Kamu adalah KawanKampus AI, tutor sebaya (peer tutor) dan mentor akademis virtual terkemuka untuk mahasiswa di Indonesia. Persona kamu adalah mahasiswa tingkat akhir yang jenius, berpengetahuan luas, metodis, namun sangat suportif, rendah hati, dan mudah didekati. Kamu bukan sekadar memberikan jawaban, tetapi mengajarkan cara berpikir.
+Kamu adalah KawanKampus AI, tutor sebaya (peer tutor) and mentor akademis virtual terkemuka untuk mahasiswa di Indonesia. Persona kamu adalah mahasiswa tingkat akhir yang jenius, berpengetahuan luas, metodis, namun sangat suportif, rendah hati, dan mudah didekati. Kamu bukan sekadar memberikan jawaban, tetapi mengajarkan cara berpikir.
 
 Misi Utama:
 Membantu user (mahasiswa) menyelesaikan tugas kuliah mereka dengan memberikan penjelasan yang mendalam, akurat secara akademis, dan komprehensif. Tujuan akhirmu adalah memastikan user memahami materi, bukan hanya menyalin jawaban.
@@ -109,168 +284,346 @@ Aturan Tambahan & Larangan:
 # UTILITIES: HISTORI & LIMITASI KUOTA
 # =====================================================
 def get_time():
-    return datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(zoneinfo.ZoneInfo("Asia/Jakarta")).strftime("%Y-%m-%d %H:%M:%S")
 
-def load_user_history(user_id: str):
-    safe_filename = "".join([c for c in user_id if c.isalpha() or c.isdigit() or c=='@' or c=='.']).rstrip()
-    filepath = os.path.join(HISTORY_FOLDER, f"{safe_filename}.json")
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-def save_user_chat(user_id: str, role: str, message: str):
-    safe_filename = "".join([c for c in user_id if c.isalpha() or c.isdigit() or c=='@' or c=='.']).rstrip()
-    filepath = os.path.join(HISTORY_FOLDER, f"{safe_filename}.json")
-    history = load_user_history(user_id)
-    history.append({"role": role, "message": message, "timestamp": get_time()})
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-# --- FUNGSI CEK KUOTA FREEMIUM ---
-def get_vertex_usage(user_id: str):
-    with open(QUOTA_FILE, "r", encoding="utf-8") as f:
-        quotas = json.load(f)
-    return quotas.get(user_id, 0) # Default 0 kalo user baru
-
-def increment_vertex_usage(user_id: str):
-    with open(QUOTA_FILE, "r", encoding="utf-8") as f:
-        quotas = json.load(f)
-    
-    current_usage = quotas.get(user_id, 0)
-    quotas[user_id] = current_usage + 1
-    
-    with open(QUOTA_FILE, "w", encoding="utf-8") as f:
-        json.dump(quotas, f, indent=2)
+def save_db_chat(session_id: str, role: str, message: str):
+    new_msg = Message(session_id=session_id, role=role, content=message, timestamp=get_time())
+    db.session.add(new_msg)
+    db.session.commit()
 
 # --- FUNGSI FILTER PERTANYAAN GAMPANG (Rule-Based NLP) ---
-def is_simple_chat(text: str):
+# =====================================================
+# FUNGSI FILTER & UTALITAS ROUTING PINTAR (ANTI-BOCOR)
+# =====================================================
+def analyze_local_routing(text: str):
+    """
+    Menganalisis teks secara lokal untuk menyaring sapaan basa-basi 
+    dan mengotomatiskan pengalihan kata kunci rekomendasi tempat.
+    """
     text_lower = text.lower().strip()
-    # Keyword dasar yang ga butuh AI
-    easy_keywords = ["halo", "hai", "pagi", "siang", "sore", "malam", "siapa kamu", "makasih", "terima kasih", "ok", "oke", "thanks"]
-    
-    # Kalo textnya cuma 1-2 kata dan ada di keyword, anggep gampang
-    if len(text_lower.split()) <= 3 and any(word in text_lower for word in easy_keywords):
-        return True
-    return False
+    words_count = len(text_lower.split())
 
-def get_simple_reply(text: str):
-    text_lower = text.lower()
-    if "siapa" in text_lower:
-        return "Aku KawanKampus AI, asisten virtual kamu buat ngerjain tugas kampus. Ada tugas yang bikin pusing?"
-    elif "makasih" in text_lower or "thanks" in text_lower or "ok" in text_lower:
-        return "Sama-sama bro! Santai aja, kalau ada tugas lagi kabarin gw ya."
-    else:
-        return "Halo bro! Gw KawanKampus AI. Ada materi kuliah atau tugas yang bisa gw bantu?"
+    # 1. OTOMATISASI JALUR REKOMENDASI LOKASI (DETEKSI TEKS)
+    # Jika mendeteksi kata berkaitan dengan rekomendasi, langsung potong komando ke sini
+    rec_keywords = [
+        "rekomendasi", "rekomendasiin", "carikan tempat", "kos", "kosan", "kontrakan",
+        "warkop", "cafe", "kafe", "fotokopi", "warung makan", "restoran", "nongkrong",
+        "tempat murah", "dekat kampus", "kuliner", "makan mana", "print", "tempat ngeprint"
+    ]
+    if any(keyword in text_lower for keyword in rec_keywords):
+        return {
+            "is_local": True,
+            "status": "recommendation_triggered",
+            "reply": "Wah, kamu lagi nyari info tempat di sekitar kampus ya? Kebetulan gw punya fitur khusus pencarian lokasi terdekat! Yuk, langsung cek dan isi filter kampus serta kategori di menu **Rekomendasi Tempat** biar hasilnya akurat sesuai database kampusmu! 📍"
+        }
 
+    # 2. FILTER CASUAL CHAT & BASA-BASI PENDEK (Maksimal 4 Kata)
+    greetings = ["halo", "hai", "oi", "hey", "helo", "pagi", "siang", "sore", "malam", "permisi", "misi", "assalamualaikum", "p", "test", "tes", "ping"]
+    identities = ["siapa kamu", "siapa lu", "lu siapa", "kamu siapa", "apa ini", "fitur apa", "bisa apa aja", "aplikasi apa"]
+    thanks_ok = ["makasih", "terima kasih", "thanks", "thank you", "tengks", "ok", "oke", "woke", "siap", "sip", "nuhun", "suwun", "mantap", "gokil", "paham"]
+    farewells = ["bye", "dadah", "duluan", "cabut", "dah", "good bye"]
+
+    if words_count <= 4:
+        if any(g == text_lower or text_lower.startswith(g) for g in greetings):
+            return {
+                "is_local": True,
+                "status": "local_reply",
+                "reply": "Halo bro! Gw KawanKampus AI. Ada materi kuliah atau tugas yang bikin pusing dan perlu gw bantu bedah? Lempar ke sini aja! 🎓"
+            }
+        if any(i in text_lower for i in identities):
+            return {
+                "is_local": True,
+                "status": "local_reply",
+                "reply": "Aku KawanKampus AI, tutor sebaya virtual kamu. Gw dilatih khusus buat bantu kamu analisis tugas kuliah secara mendalam, sekalian bisa ngasih rekomendasi tempat hits atau kosan di sekitar kampus! 🚀"
+            }
+        if any(t in text_lower for t in thanks_ok):
+            return {
+                "is_local": True,
+                "status": "local_reply",
+                "reply": "Sama-sama, Bro! Santai aja, itu udah jadi tugas gw selaku mentor sebaya lu. Kalau ada tugas lain yang bikin mentok, langsung chat gw lagi ya! 💪"
+            }
+        if any(f in text_lower for f in farewells):
+            return {
+                "is_local": True,
+                "status": "local_reply",
+                "reply": "Sip, sampai jumpa lagi! Semangat kuliahnya, jangan lupa istirahat dan ngopi ya! ☕"
+            }
+
+    return {"is_local": False}
 
 # =====================================================
 # ROUTES & CHAT MAIN LOGIC 
 # =====================================================
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "KawanKampus AI API Running", "version": "Freemium-v2"}), 200
+    return jsonify({"status": "KawanKampus AI API Running", "version": "Production-v3"}), 200
 
-# 🌟 NEW ENDPOINT: BUAT JAWAB PERMINTAAN /data/config DARI HTML 🌟
 @app.route("/data/config", methods=["GET"])
 def get_config():
-    # Catatan: Silakan sesuaikan nama kampus dan kategori di bawah ini 
-    # dengan isi kolom yang beneran ada di file "cleaned_places.csv" lu!
-    config_data = {
-        "kampus": ["UI", "ITB", "UGM", "UNPAD", "UB", "ITS", "UNDIP", "UNS"], 
-        "kategori": ["Kosan", "Warkop", "Cafe", "Fotokopi", "Warung Makan", "Restoran"]
-    }
-    return jsonify(config_data), 200
+    try:
+        # 1. DAFTAR MASTER KAMPUS (Disamakan persis dengan data lu)
+        raw_kampus = [
+            'Universitas Airlangga - B', 
+            'Universitas Bina Nusantara @Anggrek',
+            'Universitas Brawijaya', 
+            'Universitas Gadjah Mada',
+            'Universitas Institut Teknologi Bandung - Ganesha', 
+            'STMIK IKMI CIREBON',
+            'UNIVERSITAS MULTI DATA PALEMBANG', 
+            'Universitas Indonesia',
+            'Universitas Pendidikan Indonesia Bandung'
+        ]
+        
+        # 2. DAFTAR MASTER KATEGORI (Data kotor disaring otomatis menjadi nama bersih)
+        raw_kategori = [
+            'Apotek', 'Cafe', 'Fotokopi', 'Kedai', 'Makanan', 'Makanan Siap Saji',
+            'Minimarket', 'Perhentian Bus', 'Pizza', 'Print', 'Restoran',
+            'Restoran Padang', 'Tempat Fitness', 'Toko Es Krim', 'Warteg', 'Kedai Kopi',
+            'Apotek.Csv', 'Cafe.Csv', 'Fotocopy.Csv', 'Kedai.Csv',
+            'Makanan Siap Saji.Csv', 'Makanan.Csv', 'Minimarket.Csv',
+            'Perhentian Bus.Csv', 'Pizza.Csv', 'Print.Csv', 'Restoran Padang.Csv',
+            'Restoran.Csv', 'Tempat Fitness.Csv', 'Toko Es Krim.Csv', 'Warteg.Csv',
+            'Fotokopi.Csv', 'Reestoran Padang.Csv', 'Restaurant.Csv', 'Toko Eskrim.Csv',
+            ' Toko Eskrim.Csv'
+        ]
 
+        # Proses pembersihan kategori secara otomatis
+        cleaned_categories = set()
+        for cat in raw_kategori:
+            # Hapus ekstensi .csv / .Csv jika ada
+            clean = cat.replace(".Csv", "").replace(".csv", "")
+            # Bersihkan spasi di awal dan di akhir kata
+            clean = clean.strip()
+            
+            # Normalisasi typo yang parah agar seragam di tombol HTML
+            if clean in ["Fotocopy", "Fotokopi"]:
+                clean = "Fotokopi"
+            elif clean in ["Reestoran Padang", "Restoran Padang"]:
+                clean = "Restoran Padang"
+            elif clean in ["Restaurant", "Restoran"]:
+                clean = "Restoran"
+            elif clean in ["Toko Eskrim", "Toko Es Krim"]:
+                clean = "Toko Es Krim"
+                
+            if clean:  # Pastikan tidak kosong
+                cleaned_categories.add(clean)
+
+        # Kembalikan hasil bersih dalam bentuk list yang berurutan secara alfabetis
+        return jsonify({
+            "kampus": sorted(list(set(raw_kampus))),
+            "kategori": sorted(list(cleaned_categories))
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# =====================================================
+# MAIN ROUTE /CHAT
+# =====================================================
 @app.route("/chat", methods=["POST"])
 def chat():
     global model
     try:
-        data = request.form
+        # =====================================================
+        # 1. PENGAMAN PAYLOAD DATA: SUPPORT JSON & FORM DATA (ANTI-400)
+        # =====================================================
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form
+
+        if not data:
+            return jsonify({"success": False, "error": "Tidak ada data payload yang dikirim."}), 400
+
         user_id = data.get("user_id")
+        session_id = data.get("session_id")
         
         if not user_id:
-             return jsonify({"success": False, "error": "Wajib kirim user_id dari Frontend."}), 400
+            return jsonify({"success": False, "error": "Wajib kirim user_id dari Frontend."}), 400
+        
+        if not session_id:
+            session_id = f"default_sess_{user_id}"
 
         special_action = data.get("special_action")
-        user_message = data.get("message", "").strip()
+        user_message = str(data.get("message", "")).strip()
 
-        save_user_chat(user_id, "user", user_message)
+        # Pemutus arus jika chat biasa kosong (tapi kalau workflow rekomendasi tombol, message emang dikosongin frontend lu)
+        if not user_message and not special_action:
+            return jsonify({"success": False, "error": "Pesan kosong."}), 400
+
+        text_lower = user_message.lower()
+        words_count = len(user_message.split())
+
+        # Sync User & Session ke DB
+        user = User.query.get(user_id)
+        if not user:
+            user = User(id=user_id)
+            db.session.add(user)
+            db.session.commit()
+
+        session = ChatSession.query.get(session_id)
+        if not session:
+            title_preview = user_message if len(user_message) <= 25 else user_message[:22] + "..."
+            session = ChatSession(id=session_id, user_id=user_id, title=title_preview or "Obrolan Baru")
+            db.session.add(session)
+            db.session.commit()
+
+        if user_message:
+            save_db_chat(session_id, "user", user_message)
 
         # =====================================================
-        # MODE A: REKOMENDASI LOKASI (Gunakan logic pencarian jarak lu di sini)
+        # 2. ENGINE ROUTING LOKAL (Saring Basa-basi Ketikan User)
+        # =====================================================
+        if user_message:
+            local_route = analyze_local_routing(user_message)
+            if local_route["is_local"]:
+                ai_reply = local_route["reply"]
+                save_db_chat(session_id, "assistant", ai_reply)
+                return jsonify({
+                    "success": True, 
+                    "reply": ai_reply, 
+                    "status": local_route["status"],
+                    "usage_count": user.quota_used
+                })
+
+        # =====================================================
+        # MODE A: REKOMENDASI LOKASI (DI SINI TEMPAT EDITNYA! 🎯)
         # =====================================================
         if special_action == "recommendation_proximity":
-            reply_text = "Logic rekomendasi kampus lu jalan di sini."
-            save_user_chat(user_id, "assistant", reply_text)
-            return jsonify({"success": True, "reply": reply_text})
+            # Tangkap lemparan data tombol dari HTML lu
+            selected_uni = data.get("selected_uni")
+            selected_cat = data.get("selected_cat")
+            user_lat = data.get("lat")
+            user_lon = data.get("lon")
+
+            # --- KAMUS PENERJEMAH JALUR UTAMA ---
+            # Mengubah input tombol bersih dari HTML menjadi string kotor sesuai isi DB/File lu
+            kategori_db_map = {
+                "Apotek": "Apotek.Csv",
+                "Cafe": "Cafe.Csv",
+                "Fotokopi": "Fotokopi.Csv",
+                "Kedai": "Kedai.Csv",
+                "Makanan": "Makanan.Csv",
+                "Makanan Siap Saji": "Makanan Siap Saji.Csv",
+                "Minimarket": "Minimarket.Csv",
+                "Perhentian Bus": "Perhentian Bus.Csv",
+                "Pizza": "Pizza.Csv",
+                "Print": "Print.Csv",
+                "Restoran": "Restoran.Csv",
+                "Restoran Padang": "Restoran Padang.Csv",
+                "Tempat Fitness": "Tempat Fitness.Csv",
+                "Toko Es Krim": "Toko Es Krim.Csv",
+                "Warteg": "Warteg.Csv",
+                "Kedai Kopi": "Cafe.Csv"
+            }
+            
+            # Terjemahkan! Contoh: "Restoran Padang" berubah jadi "Restoran Padang.Csv"
+            kategori_untuk_search = kategori_db_map.get(selected_cat, selected_cat)
+
+            # =================================================================
+            # LOGIKA LOGIC REKOMENDASI LU (Silakan ganti/sesuaikan dengan logic hitung jarak lu)
+            # =================================================================
+            try:
+                # CONTOH IMPLEMENTASI LOGIC (Sesuaikan dengan fungsi milik lu sendiri):
+                # info_msg = f"Menampilkan hasil pencarian untuk {selected_cat} di sekitar {selected_uni}."
+                # list_rekomendasi = hitung_jarak_terdekat(selected_uni, kategori_untuk_search, user_lat, user_lon)
+                
+                # Ini placeholder logic bawaan lama lu, silakan disematkan fungsi pemroses aslinya:
+                reply_text = f"Berikut adalah rekomendasi tempat untuk kategori **{selected_cat}** di sekitar **{selected_uni}** yang paling dekat dari lokasimu bro! Silakan klik untuk membuka rute map."
+                list_rekomendasi = [] # Isi dengan array object [{name:..., map_link:..., distance:...}] hasil filter lu
+                
+            except Exception as e:
+                reply_text = f"Gagal memproses data lokasi: {str(e)}"
+                list_rekomendasi = []
+
+            save_db_chat(session_id, "assistant", reply_text)
+            return jsonify({
+                "success": True, 
+                "reply": reply_text, 
+                "recommendations": list_rekomendasi, # Ini nanti dibaca oleh fungsi `renderRecommendations()` di HTML lu
+                "status": "recommendation_triggered"
+            })
 
         # =====================================================
-        # MODE B: BANTU TUGAS (Dengan Filter & Limitasi)
+        # MODE B: BANTU TUGAS (Proses Masuk ke Vertex AI)
         # =====================================================
         else:
             is_task_mode_active = data.get("task_mode") == "true"
-
-            if not user_message:
-                return jsonify({"success": False, "error": "Pesan kosong."}), 400
                 
-            if is_task_mode_active or "tugas" in user_message.lower():
+            if is_task_mode_active or "tugas" in text_lower or words_count > 4:
                 
-                # 1. FILTER PERTANYAAN GAMPANG (Ga ngurangin Kuota)
-                if is_simple_chat(user_message):
-                    ai_reply = get_simple_reply(user_message)
-                    save_user_chat(user_id, "assistant", ai_reply)
-                    return jsonify({"success": True, "reply": ai_reply, "status": "local_reply"})
-
-                # 2. CEK LIMIT KUOTA VERTEX AI (Maks 2)
-                usage_count = get_vertex_usage(user_id)
+                usage_count = user.quota_used
                 if usage_count >= 2:
-                    # BLOCKING PAYWALL TRIGGERED!
-                    paywall_msg = "Wah bro, sori banget nih. Kuota pertanyaan AI gratis kamu udah habis (Limit: 2 kali). Biar bisa nanya tugas sepuasnya, yuk **Upgrade ke KawanKampus Pro**! Hubungi admin kampus ya. 🚀"
-                    save_user_chat(user_id, "assistant", paywall_msg)
+                    paywall_msg = "Wah bro, sori banget nih. Kuota pertanyaan AI gratis kamu udah habis (Limit: 2 kali). Biar bisa nanya tugas sepuasnya, yuk **Upgrade ke KawanKampus Pro**! 🚀"
+                    save_db_chat(session_id, "assistant", paywall_msg)
                     return jsonify({"success": True, "reply": paywall_msg, "status": "quota_exceeded"})
 
-                # 3. EKSEKUSI VERTEX AI (Pertanyaan Susah & Kuota Aman)
                 if model is None: init_model()
                 
                 if model is None:
                     ai_reply = "AI offline, Bro. Bantu tugas ga bisa jalan."
                 else:
-                    prompt = f"""{SYSTEM_PROMPT}\n\nPertanyaan/Tugas User:\n{user_message}\n\nAssistant:"""
+                    past_msgs = Message.query.filter_by(session_id=session_id).order_by(Message.id.asc()).all()
+                    history_context = ""
+                    for msg in past_msgs[:-1]: 
+                        history_context += f"{msg.role.capitalize()}: {msg.content}\n"
+
+                    prompt = f"""{SYSTEM_PROMPT}\n\nRiwayat Obrolan Sebelumnya Sesi Ini:\n{history_context}\nPertanyaan/Tugas User Saat Ini:\n{user_message}\n\nAssistant:"""
+                    
                     try:
                         response = model.generate_content(prompt)
                         ai_reply = getattr(response, "text", "Maaf, AI ga ngasih jawaban.")
-                        
-                        # BERHASIL JAWAB -> POTONG/TAMBAH KUOTA
-                        increment_vertex_usage(user_id)
-                        
+                        user.quota_used += 1
+                        db.session.commit()
                     except ResourceExhausted:
                         ai_reply = "Quota GCP gw yang padat, coba lagi semenit lagi."
                     except Exception as e:
-                         ai_reply = f"Terjadi kesalahan AI: {str(e)}"
+                        db.session.rollback()
+                        ai_reply = f"Terjadi kesalahan AI: {str(e)}"
 
-                save_user_chat(user_id, "assistant", ai_reply)
-
+                save_db_chat(session_id, "assistant", ai_reply)
                 return jsonify({
                     "success": True, 
                     "reply": ai_reply,
-                    "usage_count": usage_count + 1, # Infoin ke frontend sisa berapa
+                    "usage_count": user.quota_used, 
                     "status": "ai_answered"
                 })
 
             else:
-                # FALLBACK
-                reply_text = "Aku murni bekerja buat rekomendasi tempat dan bantu tugas. Gunakan tombol ya!"
-                save_user_chat(user_id, "assistant", reply_text)
-                return jsonify({"success": True, "reply": reply_text})
+                reply_text = "Aku murni bekerja buat rekomendasi tempat dan bantu tugas kuliah, Bro. Ada tugas spesifik yang mau dibahas?"
+                save_db_chat(session_id, "assistant", reply_text)
+                return jsonify({"success": True, "reply": reply_text, "status": "fallback_reply"})
 
     except Exception as e:
+        db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
-
+            
+# =====================================================
+# ENDPOINTS ENDPOINT HISTORY BARU (MULTI-SESSION)
+# =====================================================
 @app.route("/api/history/<user_id>", methods=["GET"])
-def get_history_endpoint(user_id):
-    history = load_user_history(user_id)
-    return jsonify({"user_id": user_id, "history": history})
+def get_old_history(user_id):
+    """Fallback endpoint lama biar web lama lu ga error tiba-tiba"""
+    messages = Message.query.join(ChatSession).filter(ChatSession.user_id == user_id).order_by(Message.id.asc()).all()
+    history_list = [{"role": m.role, "message": m.content, "timestamp": m.timestamp} for m in messages]
+    return jsonify({"user_id": user_id, "history": history_list})
+
+@app.route("/api/history/<user_id>/<session_id>", methods=["GET"])
+def get_session_history(user_id, session_id):
+    """Endpoint baru untuk meload chat per Ruangan/Sesi khusus"""
+    messages = Message.query.filter_by(session_id=session_id).order_by(Message.id.asc()).all()
+    history_list = [{"role": m.role, "message": m.content, "timestamp": m.timestamp} for m in messages]
+    return jsonify({"success": True, "user_id": user_id, "session_id": session_id, "history": history_list})
+
+@app.route("/api/sessions/<user_id>", methods=["GET"])
+def get_user_sessions(user_id):
+    """Endpoint untuk list daftar obrolan di sidebar kiri"""
+    sessions = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.created_at.desc()).all()
+    sessions_list = [{"session_id": s.id, "title": s.title, "created_at": s.created_at.strftime("%Y-%m-%d %H:%M:%S")} for s in sessions]
+    return jsonify({"success": True, "sessions": sessions_list})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Menyesuaikan port dinamis Cloud Run (PORT), default ke 5000 untuk lokal
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
