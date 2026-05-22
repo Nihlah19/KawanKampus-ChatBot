@@ -1,6 +1,7 @@
 # requirements.txt
 Flask
 flask-cors
+Flask-SQLAlchemy
 pandas
 vertexai
 google-cloud-aiplatform
