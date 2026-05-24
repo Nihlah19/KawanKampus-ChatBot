@@ -27,12 +27,11 @@ CORS(app)
 # =====================================================
 # Membaca DATABASE_URL dari environment variable (untuk Postgres di Cloud Run)
 # Jika tidak ada, otomatis menggunakan SQLite lokal (kawankampus.db)
-DATABASE_URL = os.environ.get(
-    "DATABASE",
-    "sqlite:///kawankampus.db"
-)
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL belum diset!")
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -184,6 +183,15 @@ def get_nearest_recommendations(user_lat, user_lon, uni_name, category_name):
     uni_id = uni_name.lower().strip()
     cat_id = category_name.lower().strip()
 
+    print("UNI:", uni_id)
+    print("CAT:", cat_id)
+
+    print("DATA KAMPUS:")
+    print(places_df['kampus_id'].unique()[:10])
+
+    print("DATA KATEGORI:")
+    print(places_df['jenis_id'].unique()[:10])
+
     # Filter berdasarkan Kampus ID DAN Kategori ID
     results = places_df[
         (places_df['kampus_id'] == uni_id) & 
@@ -232,7 +240,8 @@ def init_model():
     global model
     try:
         if model is None:
-            model = GenerativeModel(selected_model)
+            def get_model():
+                return GenerativeModel(selected_model)    
     except Exception as e:
         print(f"❌ ERROR MODEL: {e}")
 init_model()
@@ -497,30 +506,6 @@ def chat():
             user_lat = data.get("lat")
             user_lon = data.get("lon")
 
-            # --- KAMUS PENERJEMAH JALUR UTAMA ---
-            # Mengubah input tombol bersih dari HTML menjadi string kotor sesuai isi DB/File lu
-            kategori_db_map = {
-                "Apotek": "Apotek.Csv",
-                "Cafe": "Cafe.Csv",
-                "Fotokopi": "Fotokopi.Csv",
-                "Kedai": "Kedai.Csv",
-                "Makanan": "Makanan.Csv",
-                "Makanan Siap Saji": "Makanan Siap Saji.Csv",
-                "Minimarket": "Minimarket.Csv",
-                "Perhentian Bus": "Perhentian Bus.Csv",
-                "Pizza": "Pizza.Csv",
-                "Print": "Print.Csv",
-                "Restoran": "Restoran.Csv",
-                "Restoran Padang": "Restoran Padang.Csv",
-                "Tempat Fitness": "Tempat Fitness.Csv",
-                "Toko Es Krim": "Toko Es Krim.Csv",
-                "Warteg": "Warteg.Csv",
-                "Kedai Kopi": "Cafe.Csv"
-            }
-            
-            # Terjemahkan! Contoh: "Restoran Padang" berubah jadi "Restoran Padang.Csv"
-            kategori_untuk_search = kategori_db_map.get(selected_cat, selected_cat)
-
             # =================================================================
             # LOGIKA LOGIC REKOMENDASI LU (Silakan ganti/sesuaikan dengan logic hitung jarak lu)
             # =================================================================
@@ -530,12 +515,53 @@ def chat():
                 # list_rekomendasi = hitung_jarak_terdekat(selected_uni, kategori_untuk_search, user_lat, user_lon)
                 
                 # Ini placeholder logic bawaan lama lu, silakan disematkan fungsi pemroses aslinya:
-                reply_text = f"Berikut adalah rekomendasi tempat untuk kategori **{selected_cat}** di sekitar **{selected_uni}** yang paling dekat dari lokasimu bro! Silakan klik untuk membuka rute map."
-                list_rekomendasi = [] # Isi dengan array object [{name:..., map_link:..., distance:...}] hasil filter lu
-                
+                try:
+                    # validasi input
+                    if not selected_uni or not selected_cat:
+                        return jsonify({
+                            "success": False,
+                            "error": "Kampus atau kategori belum dipilih."
+                        }), 400
+
+                    if not user_lat or not user_lon:
+                        return jsonify({
+                            "success": False,
+                            "error": "Lokasi user tidak ditemukan."
+                        }), 400
+
+                    # convert koordinat
+                    try:
+                        user_lat = float(user_lat)
+                        user_lon = float(user_lon)
+                    except ValueError:
+                        return jsonify({
+                            "success": False,
+                            "error": "Format koordinat invalid."
+                        }), 400
+                    
+                    # ambil rekomendasi 5 terdekat
+                    list_rekomendasi, reply_text = get_nearest_recommendations(
+                        user_lat=user_lat,
+                        user_lon=user_lon,
+                        uni_name=selected_uni,
+                        category_name=selected_cat
+                    )
+
+                    # fallback kalau kosong
+                    if list_rekomendasi is None:
+                        list_rekomendasi = []
+
+                except Exception as e:
+                    print("ERROR REKOMENDASI:", str(e))
+
+                    reply_text = f"Gagal memproses rekomendasi: {str(e)}"
+                    list_rekomendasi = []
+
             except Exception as e:
-                reply_text = f"Gagal memproses data lokasi: {str(e)}"
-                list_rekomendasi = []
+                    print("ERROR REKOMENDASI:", str(e))
+
+                    reply_text = f"Gagal memproses rekomendasi: {str(e)}"
+                    list_rekomendasi = []
 
             save_db_chat(session_id, "assistant", reply_text)
             return jsonify({
@@ -554,7 +580,16 @@ def chat():
             if is_task_mode_active or "tugas" in text_lower or words_count > 4:
                 
                 usage_count = user.quota_used
-                if usage_count >= 2:
+                updated = User.query.filter(
+                    User.id == user_id,
+                    User.quota_used < 2
+                ).update({
+                    "quota_used": User.quota_used + 1
+                })
+
+                db.session.commit()
+
+                if updated == 0:                                   
                     paywall_msg = "Wah bro, sori banget nih. Kuota pertanyaan AI gratis kamu udah habis (Limit: 2 kali). Biar bisa nanya tugas sepuasnya, yuk **Upgrade ke KawanKampus Pro**! 🚀"
                     save_db_chat(session_id, "assistant", paywall_msg)
                     return jsonify({"success": True, "reply": paywall_msg, "status": "quota_exceeded"})
@@ -564,7 +599,12 @@ def chat():
                 if model is None:
                     ai_reply = "AI offline, Bro. Bantu tugas ga bisa jalan."
                 else:
-                    past_msgs = Message.query.filter_by(session_id=session_id).order_by(Message.id.asc()).all()
+                    past_msgs = Message.query.filter_by(session_id=session_id)\
+                        .order_by(Message.id.desc())\
+                        .limit(20)\
+                        .all()
+
+                    past_msgs = list(reversed(past_msgs))                    
                     history_context = ""
                     for msg in past_msgs[:-1]: 
                         history_context += f"{msg.role.capitalize()}: {msg.content}\n"
@@ -623,7 +663,16 @@ def get_user_sessions(user_id):
     sessions_list = [{"session_id": s.id, "title": s.title, "created_at": s.created_at.strftime("%Y-%m-%d %H:%M:%S")} for s in sessions]
     return jsonify({"success": True, "sessions": sessions_list})
 
+@app.route("/test-db")
+def test_db():
+    try:
+        db.session.execute("SELECT 1")
+        return {"status": "connected"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 if __name__ == "__main__":
     # Menyesuaikan port dinamis Cloud Run (PORT), default ke 5000 untuk lokal
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port)
+
